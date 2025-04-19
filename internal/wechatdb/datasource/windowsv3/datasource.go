@@ -2,29 +2,64 @@ package windowsv3
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 
 	"github.com/sjzar/chatlog/internal/errors"
 	"github.com/sjzar/chatlog/internal/model"
+	"github.com/sjzar/chatlog/internal/wechatdb/datasource/dbm"
 	"github.com/sjzar/chatlog/pkg/util"
 )
 
 const (
-	MessageFilePattern = "^MSG([0-9]?[0-9])?\\.db$"
-	ContactFilePattern = "^MicroMsg.db$"
-	ImageFilePattern   = "^HardLinkImage\\.db$"
-	VideoFilePattern   = "^HardLinkVideo\\.db$"
-	FileFilePattern    = "^HardLinkFile\\.db$"
-	VoiceFilePattern   = "^MediaMSG([0-9])?\\.db$"
+	Message = "message"
+	Contact = "contact"
+	Image   = "image"
+	Video   = "video"
+	File    = "file"
+	Voice   = "voice"
 )
+
+var Groups = []*dbm.Group{
+	{
+		Name:      Message,
+		Pattern:   `^MSG([0-9]?[0-9])?\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      Contact,
+		Pattern:   `^MicroMsg\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      Image,
+		Pattern:   `^HardLinkImage\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      Video,
+		Pattern:   `^HardLinkVideo\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      File,
+		Pattern:   `^HardLinkFile\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      Voice,
+		Pattern:   `^MediaMSG([0-9])?\.db$`,
+		BlackList: []string{},
+	},
+}
 
 // MessageDBInfo 保存消息数据库的信息
 type MessageDBInfo struct {
@@ -36,67 +71,71 @@ type MessageDBInfo struct {
 
 // DataSource 实现了 DataSource 接口
 type DataSource struct {
-	// 消息数据库
-	messageFiles []MessageDBInfo
-	messageDbs   map[string]*sql.DB
+	path string
+	dbm  *dbm.DBManager
 
-	// 联系人数据库
-	contactDbFile string
-	contactDb     *sql.DB
-
-	imageDb *sql.DB
-	videoDb *sql.DB
-	fileDb  *sql.DB
-	voiceDb []*sql.DB
+	// 消息数据库信息
+	messageInfos []MessageDBInfo
 }
 
 // New 创建一个新的 WindowsV3DataSource
 func New(path string) (*DataSource, error) {
 	ds := &DataSource{
-		messageFiles: make([]MessageDBInfo, 0),
-		messageDbs:   make(map[string]*sql.DB),
-		voiceDb:      make([]*sql.DB, 0),
+		path:         path,
+		dbm:          dbm.NewDBManager(path),
+		messageInfos: make([]MessageDBInfo, 0),
 	}
 
-	// 初始化消息数据库
-	if err := ds.initMessageDbs(path); err != nil {
+	for _, g := range Groups {
+		ds.dbm.AddGroup(g)
+	}
+
+	if err := ds.dbm.Start(); err != nil {
+		return nil, err
+	}
+
+	if err := ds.initMessageDbs(); err != nil {
 		return nil, errors.DBInitFailed(err)
 	}
 
-	// 初始化联系人数据库
-	if err := ds.initContactDb(path); err != nil {
-		return nil, errors.DBInitFailed(err)
-	}
-
-	if err := ds.initMediaDb(path); err != nil {
-		return nil, errors.DBInitFailed(err)
-	}
-
-	if err := ds.initVoiceDb(path); err != nil {
-		return nil, errors.DBInitFailed(err)
-	}
+	ds.dbm.AddCallback(Message, func(event fsnotify.Event) error {
+		if !event.Op.Has(fsnotify.Create) {
+			return nil
+		}
+		if err := ds.initMessageDbs(); err != nil {
+			log.Err(err).Msgf("Failed to reinitialize message DBs: %s", event.Name)
+		}
+		return nil
+	})
 
 	return ds, nil
 }
 
-// initMessageDbs 初始化消息数据库
-func (ds *DataSource) initMessageDbs(path string) error {
-	// 查找所有消息数据库文件
-	files, err := util.FindFilesWithPatterns(path, MessageFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, MessageFilePattern, err)
+func (ds *DataSource) SetCallback(name string, callback func(event fsnotify.Event) error) error {
+	if name == "chatroom" {
+		name = Contact
 	}
+	return ds.dbm.AddCallback(name, callback)
+}
 
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, MessageFilePattern, nil)
+// initMessageDbs 初始化消息数据库
+func (ds *DataSource) initMessageDbs() error {
+	// 获取所有消息数据库文件路径
+	dbPaths, err := ds.dbm.GetDBPath(Message)
+	if err != nil {
+		if strings.Contains(err.Error(), "db file not found") {
+			ds.messageInfos = make([]MessageDBInfo, 0)
+			return nil
+		}
+		return err
 	}
 
 	// 处理每个数据库文件
-	for _, filePath := range files {
-		// 连接数据库
-		db, err := sql.Open("sqlite3", filePath)
+	infos := make([]MessageDBInfo, 0)
+	for _, filePath := range dbPaths {
+		db, err := ds.dbm.OpenDB(filePath)
 		if err != nil {
-			log.Err(err).Msgf("连接数据库 %s 失败", filePath)
+			log.Err(err).Msgf("获取数据库 %s 失败", filePath)
 			continue
 		}
 
@@ -106,7 +145,6 @@ func (ds *DataSource) initMessageDbs(path string) error {
 		rows, err := db.Query("SELECT tableIndex, tableVersion, tableDesc FROM DBInfo")
 		if err != nil {
 			log.Err(err).Msgf("查询数据库 %s 的 DBInfo 表失败", filePath)
-			db.Close()
 			continue
 		}
 
@@ -133,7 +171,6 @@ func (ds *DataSource) initMessageDbs(path string) error {
 		rows, err = db.Query("SELECT UsrName FROM Name2ID")
 		if err != nil {
 			log.Err(err).Msgf("查询数据库 %s 的 Name2ID 表失败", filePath)
-			db.Close()
 			continue
 		}
 
@@ -150,123 +187,34 @@ func (ds *DataSource) initMessageDbs(path string) error {
 		rows.Close()
 
 		// 保存数据库信息
-		ds.messageFiles = append(ds.messageFiles, MessageDBInfo{
+		infos = append(infos, MessageDBInfo{
 			FilePath:  filePath,
 			StartTime: startTime,
 			TalkerMap: talkerMap,
 		})
-
-		// 保存数据库连接
-		ds.messageDbs[filePath] = db
 	}
 
 	// 按照 StartTime 排序数据库文件
-	sort.Slice(ds.messageFiles, func(i, j int) bool {
-		return ds.messageFiles[i].StartTime.Before(ds.messageFiles[j].StartTime)
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].StartTime.Before(infos[j].StartTime)
 	})
 
 	// 设置结束时间
-	for i := range ds.messageFiles {
-		if i == len(ds.messageFiles)-1 {
-			ds.messageFiles[i].EndTime = time.Now()
+	for i := range infos {
+		if i == len(infos)-1 {
+			infos[i].EndTime = time.Now()
 		} else {
-			ds.messageFiles[i].EndTime = ds.messageFiles[i+1].StartTime
+			infos[i].EndTime = infos[i+1].StartTime
 		}
 	}
-
-	return nil
-}
-
-// initContactDb 初始化联系人数据库
-func (ds *DataSource) initContactDb(path string) error {
-	files, err := util.FindFilesWithPatterns(path, ContactFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, ContactFilePattern, err)
-	}
-
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, ContactFilePattern, nil)
-	}
-
-	ds.contactDbFile = files[0]
-
-	ds.contactDb, err = sql.Open("sqlite3", ds.contactDbFile)
-	if err != nil {
-		return errors.DBConnectFailed(ds.contactDbFile, err)
-	}
-
-	return nil
-}
-
-// initContactDb 初始化联系人数据库
-func (ds *DataSource) initMediaDb(path string) error {
-	files, err := util.FindFilesWithPatterns(path, ImageFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, ImageFilePattern, err)
-	}
-
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, ImageFilePattern, nil)
-	}
-
-	ds.imageDb, err = sql.Open("sqlite3", files[0])
-	if err != nil {
-		return errors.DBConnectFailed(files[0], err)
-	}
-
-	files, err = util.FindFilesWithPatterns(path, VideoFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, VideoFilePattern, err)
-	}
-
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, VideoFilePattern, nil)
-	}
-
-	ds.videoDb, err = sql.Open("sqlite3", files[0])
-	if err != nil {
-		return errors.DBConnectFailed(files[0], err)
-	}
-
-	files, err = util.FindFilesWithPatterns(path, FileFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, FileFilePattern, err)
-	}
-
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, FileFilePattern, nil)
-	}
-
-	ds.fileDb, err = sql.Open("sqlite3", files[0])
-	if err != nil {
-		return errors.DBConnectFailed(files[0], err)
-	}
-
-	return nil
-}
-
-func (ds *DataSource) initVoiceDb(path string) error {
-	files, err := util.FindFilesWithPatterns(path, VoiceFilePattern, true)
-	if err != nil {
-		return errors.DBFileNotFound(path, VoiceFilePattern, err)
-	}
-	if len(files) == 0 {
-		return errors.DBFileNotFound(path, VoiceFilePattern, nil)
-	}
-	for _, file := range files {
-		db, err := sql.Open("sqlite3", file)
-		if err != nil {
-			return errors.DBConnectFailed(files[0], err)
-		}
-		ds.voiceDb = append(ds.voiceDb, db)
-	}
+	ds.messageInfos = infos
 	return nil
 }
 
 // getDBInfosForTimeRange 获取时间范围内的数据库信息
 func (ds *DataSource) getDBInfosForTimeRange(startTime, endTime time.Time) []MessageDBInfo {
 	var dbs []MessageDBInfo
-	for _, info := range ds.messageFiles {
+	for _, info := range ds.messageInfos {
 		if info.StartTime.Before(endTime) && info.EndTime.After(startTime) {
 			dbs = append(dbs, info)
 		}
@@ -274,21 +222,38 @@ func (ds *DataSource) getDBInfosForTimeRange(startTime, endTime time.Time) []Mes
 	return dbs
 }
 
-// GetMessages 实现 DataSource 接口的 GetMessages 方法
-func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.Time, talker string, limit, offset int) ([]*model.Message, error) {
+func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.Time, talker string, sender string, keyword string, limit, offset int) ([]*model.Message, error) {
+	if talker == "" {
+		return nil, errors.ErrTalkerEmpty
+	}
+
+	// 解析talker参数，支持多个talker（以英文逗号分隔）
+	talkers := util.Str2List(talker, ",")
+	if len(talkers) == 0 {
+		return nil, errors.ErrTalkerEmpty
+	}
+
 	// 找到时间范围内的数据库文件
 	dbInfos := ds.getDBInfosForTimeRange(startTime, endTime)
 	if len(dbInfos) == 0 {
 		return nil, errors.TimeRangeNotFound(startTime, endTime)
 	}
 
-	if len(dbInfos) == 1 {
-		// LIMIT 和 OFFSET 逻辑在单文件情况下可以直接在 SQL 里处理
-		return ds.getMessagesSingleFile(ctx, dbInfos[0], startTime, endTime, talker, limit, offset)
+	// 解析sender参数，支持多个发送者（以英文逗号分隔）
+	senders := util.Str2List(sender, ",")
+
+	// 预编译正则表达式（如果有keyword）
+	var regex *regexp.Regexp
+	if keyword != "" {
+		var err error
+		regex, err = regexp.Compile(keyword)
+		if err != nil {
+			return nil, errors.QueryFailed("invalid regex pattern", err)
+		}
 	}
 
 	// 从每个相关数据库中查询消息
-	totalMessages := []*model.Message{}
+	filteredMessages := []*model.Message{}
 
 	for _, dbInfo := range dbInfos {
 		// 检查上下文是否已取消
@@ -296,161 +261,143 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 			return nil, err
 		}
 
-		db, ok := ds.messageDbs[dbInfo.FilePath]
-		if !ok {
+		db, err := ds.dbm.OpenDB(dbInfo.FilePath)
+		if err != nil {
 			log.Error().Msgf("数据库 %s 未打开", dbInfo.FilePath)
 			continue
 		}
 
-		// 构建查询条件
-		conditions := []string{"Sequence >= ? AND Sequence <= ?"}
-		args := []interface{}{startTime.Unix() * 1000, endTime.Unix() * 1000}
+		// 对每个talker进行查询
+		for _, talkerItem := range talkers {
+			// 构建查询条件
+			conditions := []string{"Sequence >= ? AND Sequence <= ?"}
+			args := []interface{}{startTime.Unix() * 1000, endTime.Unix() * 1000}
 
-		if len(talker) > 0 {
-			talkerID, ok := dbInfo.TalkerMap[talker]
+			// 添加talker条件
+			talkerID, ok := dbInfo.TalkerMap[talkerItem]
 			if ok {
 				conditions = append(conditions, "TalkerId = ?")
 				args = append(args, talkerID)
 			} else {
 				conditions = append(conditions, "StrTalker = ?")
-				args = append(args, talker)
+				args = append(args, talkerItem)
 			}
-		}
 
-		query := fmt.Sprintf(`
-            SELECT MsgSvrID, Sequence, CreateTime, StrTalker, IsSender, 
-                Type, SubType, StrContent, CompressContent, BytesExtra
-            FROM MSG 
-            WHERE %s 
-            ORDER BY Sequence ASC
-        `, strings.Join(conditions, " AND "))
+			query := fmt.Sprintf(`
+				SELECT MsgSvrID, Sequence, CreateTime, StrTalker, IsSender, 
+					Type, SubType, StrContent, CompressContent, BytesExtra
+				FROM MSG 
+				WHERE %s 
+				ORDER BY Sequence ASC
+			`, strings.Join(conditions, " AND "))
 
-		// 执行查询
-		rows, err := db.QueryContext(ctx, query, args...)
-		if err != nil {
-			log.Err(err).Msgf("查询数据库 %s 失败", dbInfo.FilePath)
-			continue
-		}
-
-		// 处理查询结果
-		for rows.Next() {
-			var msg model.MessageV3
-			var compressContent []byte
-			var bytesExtra []byte
-
-			err := rows.Scan(
-				&msg.MsgSvrID,
-				&msg.Sequence,
-				&msg.CreateTime,
-				&msg.StrTalker,
-				&msg.IsSender,
-				&msg.Type,
-				&msg.SubType,
-				&msg.StrContent,
-				&compressContent,
-				&bytesExtra,
-			)
+			// 执行查询
+			rows, err := db.QueryContext(ctx, query, args...)
 			if err != nil {
-				log.Err(err).Msg("扫描消息行失败")
+				// 如果表不存在，跳过此talker
+				if strings.Contains(err.Error(), "no such table") {
+					continue
+				}
+				log.Err(err).Msgf("从数据库 %s 查询消息失败", dbInfo.FilePath)
 				continue
 			}
-			msg.CompressContent = compressContent
-			msg.BytesExtra = bytesExtra
 
-			totalMessages = append(totalMessages, msg.Wrap())
-		}
-		rows.Close()
+			// 处理查询结果，在读取时进行过滤
+			for rows.Next() {
+				var msg model.MessageV3
+				var compressContent []byte
+				var bytesExtra []byte
 
-		if limit+offset > 0 && len(totalMessages) >= limit+offset {
-			break
+				err := rows.Scan(
+					&msg.MsgSvrID,
+					&msg.Sequence,
+					&msg.CreateTime,
+					&msg.StrTalker,
+					&msg.IsSender,
+					&msg.Type,
+					&msg.SubType,
+					&msg.StrContent,
+					&compressContent,
+					&bytesExtra,
+				)
+				if err != nil {
+					rows.Close()
+					return nil, errors.ScanRowFailed(err)
+				}
+				msg.CompressContent = compressContent
+				msg.BytesExtra = bytesExtra
+
+				// 将消息转换为标准格式
+				message := msg.Wrap()
+
+				// 应用sender过滤
+				if len(senders) > 0 {
+					senderMatch := false
+					for _, s := range senders {
+						if message.Sender == s {
+							senderMatch = true
+							break
+						}
+					}
+					if !senderMatch {
+						continue // 不匹配sender，跳过此消息
+					}
+				}
+
+				// 应用keyword过滤
+				if regex != nil {
+					plainText := message.PlainTextContent()
+					if !regex.MatchString(plainText) {
+						continue // 不匹配keyword，跳过此消息
+					}
+				}
+
+				// 通过所有过滤条件，保留此消息
+				filteredMessages = append(filteredMessages, message)
+
+				// 检查是否已经满足分页处理数量
+				if limit > 0 && len(filteredMessages) >= offset+limit {
+					// 已经获取了足够的消息，可以提前返回
+					rows.Close()
+
+					// 对所有消息按时间排序
+					sort.Slice(filteredMessages, func(i, j int) bool {
+						return filteredMessages[i].Seq < filteredMessages[j].Seq
+					})
+
+					// 处理分页
+					if offset >= len(filteredMessages) {
+						return []*model.Message{}, nil
+					}
+					end := offset + limit
+					if end > len(filteredMessages) {
+						end = len(filteredMessages)
+					}
+					return filteredMessages[offset:end], nil
+				}
+			}
+			rows.Close()
 		}
 	}
 
 	// 对所有消息按时间排序
-	sort.Slice(totalMessages, func(i, j int) bool {
-		return totalMessages[i].Seq < totalMessages[j].Seq
+	sort.Slice(filteredMessages, func(i, j int) bool {
+		return filteredMessages[i].Seq < filteredMessages[j].Seq
 	})
 
 	// 处理分页
 	if limit > 0 {
-		if offset >= len(totalMessages) {
+		if offset >= len(filteredMessages) {
 			return []*model.Message{}, nil
 		}
 		end := offset + limit
-		if end > len(totalMessages) {
-			end = len(totalMessages)
+		if end > len(filteredMessages) {
+			end = len(filteredMessages)
 		}
-		return totalMessages[offset:end], nil
+		return filteredMessages[offset:end], nil
 	}
 
-	return totalMessages, nil
-}
-
-// getMessagesSingleFile 从单个数据库文件获取消息
-func (ds *DataSource) getMessagesSingleFile(ctx context.Context, dbInfo MessageDBInfo, startTime, endTime time.Time, talker string, limit, offset int) ([]*model.Message, error) {
-	// 构建查询条件
-	conditions := []string{"Sequence >= ? AND Sequence <= ?"}
-	args := []interface{}{startTime.Unix() * 1000, endTime.Unix() * 1000}
-	if len(talker) > 0 {
-		// TalkerId 有索引，优先使用
-		talkerID, ok := dbInfo.TalkerMap[talker]
-		if ok {
-			conditions = append(conditions, "TalkerId = ?")
-			args = append(args, talkerID)
-		} else {
-			conditions = append(conditions, "StrTalker = ?")
-			args = append(args, talker)
-		}
-	}
-	query := fmt.Sprintf(`
-        SELECT MsgSvrID, Sequence, CreateTime, StrTalker, IsSender, 
-            Type, SubType, StrContent, CompressContent, BytesExtra
-        FROM MSG 
-        WHERE %s 
-        ORDER BY Sequence ASC
-    `, strings.Join(conditions, " AND "))
-
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-
-		if offset > 0 {
-			query += fmt.Sprintf(" OFFSET %d", offset)
-		}
-	}
-
-	// 执行查询
-	rows, err := ds.messageDbs[dbInfo.FilePath].QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, errors.QueryFailed(query, err)
-	}
-	defer rows.Close()
-
-	// 处理查询结果
-	totalMessages := []*model.Message{}
-	for rows.Next() {
-		var msg model.MessageV3
-		var compressContent []byte
-		var bytesExtra []byte
-		err := rows.Scan(
-			&msg.MsgSvrID,
-			&msg.Sequence,
-			&msg.CreateTime,
-			&msg.StrTalker,
-			&msg.IsSender,
-			&msg.Type,
-			&msg.SubType,
-			&msg.StrContent,
-			&compressContent,
-			&bytesExtra,
-		)
-		if err != nil {
-			return nil, errors.ScanRowFailed(err)
-		}
-		msg.CompressContent = compressContent
-		msg.BytesExtra = bytesExtra
-		totalMessages = append(totalMessages, msg.Wrap())
-	}
-	return totalMessages, nil
+	return filteredMessages, nil
 }
 
 // GetContacts 实现获取联系人信息的方法
@@ -478,7 +425,11 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 	}
 
 	// 执行查询
-	rows, err := ds.contactDb.QueryContext(ctx, query, args...)
+	db, err := ds.dbm.GetDB(Contact)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, errors.QueryFailed(query, err)
 	}
@@ -516,7 +467,11 @@ func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offse
 		args = []interface{}{key}
 
 		// 执行查询
-		rows, err := ds.contactDb.QueryContext(ctx, query, args...)
+		db, err := ds.dbm.GetDB(Contact)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, errors.QueryFailed(query, err)
 		}
@@ -543,7 +498,7 @@ func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offse
 			contacts, err := ds.GetContacts(ctx, key, 1, 0)
 			if err == nil && len(contacts) > 0 && strings.HasSuffix(contacts[0].UserName, "@chatroom") {
 				// 再次尝试通过用户名查找群聊
-				rows, err := ds.contactDb.QueryContext(ctx,
+				rows, err := db.QueryContext(ctx,
 					`SELECT ChatRoomName, Reserved2, RoomData FROM ChatRoom WHERE ChatRoomName = ?`,
 					contacts[0].UserName)
 
@@ -593,7 +548,11 @@ func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offse
 		}
 
 		// 执行查询
-		rows, err := ds.contactDb.QueryContext(ctx, query, args...)
+		db, err := ds.dbm.GetDB(Contact)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, errors.QueryFailed(query, err)
 		}
@@ -647,7 +606,11 @@ func (ds *DataSource) GetSessions(ctx context.Context, key string, limit, offset
 	}
 
 	// 执行查询
-	rows, err := ds.contactDb.QueryContext(ctx, query, args...)
+	db, err := ds.dbm.GetDB(Contact)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, errors.QueryFailed(query, err)
 	}
@@ -688,25 +651,29 @@ func (ds *DataSource) GetMedia(ctx context.Context, _type string, key string) (*
 		return nil, errors.DecodeKeyFailed(err)
 	}
 
-	var db *sql.DB
+	var dbType string
 	var table1, table2 string
 
 	switch _type {
 	case "image":
-		db = ds.imageDb
+		dbType = Image
 		table1 = "HardLinkImageAttribute"
 		table2 = "HardLinkImageID"
 	case "video":
-		db = ds.videoDb
+		dbType = Video
 		table1 = "HardLinkVideoAttribute"
 		table2 = "HardLinkVideoID"
 	case "file":
-		db = ds.fileDb
+		dbType = File
 		table1 = "HardLinkFileAttribute"
 		table2 = "HardLinkFileID"
 	default:
 		return nil, errors.MediaTypeUnsupported(_type)
+	}
 
+	db, err := ds.dbm.GetDB(dbType)
+	if err != nil {
+		return nil, err
 	}
 
 	query := fmt.Sprintf(`
@@ -768,7 +735,12 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 	`
 	args := []interface{}{key}
 
-	for _, db := range ds.voiceDb {
+	dbs, err := ds.dbm.GetDBs(Voice)
+	if err != nil {
+		return nil, errors.DBConnectFailed("", err)
+	}
+
+	for _, db := range dbs {
 		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, errors.QueryFailed(query, err)
@@ -798,41 +770,5 @@ func (ds *DataSource) GetVoice(ctx context.Context, key string) (*model.Media, e
 
 // Close 实现 DataSource 接口的 Close 方法
 func (ds *DataSource) Close() error {
-	var errs []error
-
-	// 关闭消息数据库连接
-	for _, db := range ds.messageDbs {
-		if err := db.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	// 关闭联系人数据库连接
-	if ds.contactDb != nil {
-		if err := ds.contactDb.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if ds.imageDb != nil {
-		if err := ds.imageDb.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if ds.videoDb != nil {
-		if err := ds.videoDb.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if ds.fileDb != nil {
-		if err := ds.fileDb.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return errors.DBCloseFailed(errs[0])
-	}
-
-	return nil
+	return ds.dbm.Close()
 }

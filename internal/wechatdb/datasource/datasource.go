@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/sjzar/chatlog/internal/errors"
 	"github.com/sjzar/chatlog/internal/model"
 	"github.com/sjzar/chatlog/internal/wechatdb/datasource/darwinv3"
@@ -14,7 +16,7 @@ import (
 type DataSource interface {
 
 	// 消息
-	GetMessages(ctx context.Context, startTime, endTime time.Time, talker string, limit, offset int) ([]*model.Message, error)
+	GetMessages(ctx context.Context, startTime, endTime time.Time, talker string, sender string, keyword string, limit, offset int) ([]*model.Message, error)
 
 	// 联系人
 	GetContacts(ctx context.Context, key string, limit, offset int) ([]*model.Contact, error)
@@ -27,6 +29,9 @@ type DataSource interface {
 
 	// 媒体
 	GetMedia(ctx context.Context, _type string, key string) (*model.Media, error)
+
+	// 设置回调函数
+	SetCallback(name string, callback func(event fsnotify.Event) error) error
 
 	Close() error
 }
